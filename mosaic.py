@@ -6,7 +6,11 @@ import sys
 import numpy as np
 from PIL import Image
 from skimage import img_as_float
-from skimage.measure import compare_mse
+from skimage.metrics import mean_squared_error as compare_mse
+from tqdm import tqdm
+
+import multiprocessing
+from functools import partial
 
 def shuffle_first_items(lst, i):
     if not i:
@@ -77,11 +81,12 @@ def aspect_crop_to_extent(img, target_aspect, centerpoint=None):
     return img.crop(resize)
 
 class Config:
-    def __init__(self, tile_ratio=1920/800, tile_width=50, enlargement=8, color_mode='RGB'):
+    def __init__(self, tile_ratio=1920/800, tile_width=50, enlargement=8, color_mode='RGB', blending=0):
         self.tile_ratio = tile_ratio # 2.4
         self.tile_width = tile_width # height/width of mosaic tiles in pixels
         self.enlargement = enlargement # mosaic image will be this many times wider and taller than original
         self.color_mode = color_mode # mosaic image will be this many times wider and taller than original
+        self.blending = blending
 
     @property
     def tile_height(self):
@@ -99,6 +104,7 @@ class TileBox:
     def __init__(self, tile_paths, config):
         self.config = config
         self.tiles = list()
+        self.used_tiles = set()
         self.prepare_tiles_from_paths(tile_paths)
         
     def __process_tile(self, tile_path):
@@ -114,26 +120,29 @@ class TileBox:
         progress = ProgressCounter(len(tile_paths))
         for tile_path in tile_paths:
             progress.update()
-            self.__process_tile(tile_path)          
+            if os.path.basename(tile_path)[0] != '.':
+                self.__process_tile(tile_path)
         print('Processed tiles.')
         return True
 
     def best_tile_block_match(self, tile_block_original):
-        match_results = [img_mse(t, tile_block_original) for t in self.tiles] 
-        best_fit_tile_index = np.argmin(match_results)
+        match_results = [img_mse(t, tile_block_original) for i, t in enumerate(self.tiles) if i not in self.used_tiles]
+        best_fit_tiles = np.argsort(match_results)[:5]
+        best_fit_tile_index = np.random.choice(best_fit_tiles)
         return best_fit_tile_index
 
     def best_tile_from_block(self, tile_block_original, reuse=False):
-        if not self.tiles:
+        if len(self.tiles) == len(self.used_tiles):
             print('Ran out of images.')
             raise KeyboardInterrupt
         
         #start_time = time.time()
         i = self.best_tile_block_match(tile_block_original)
         #print("BLOCK MATCH took --- %s seconds ---" % (time.time() - start_time))
-        match = self.tiles[i].copy()
+#        match = self.tiles[i].copy()
         if not reuse:
-            del self.tiles[i]
+            self.used_tiles.add(i)
+        match = i
         return match
 
 class SourceImage:
@@ -171,16 +180,19 @@ class MosaicImage:
         self.y_tile_count = int(original_img.size[1] / self.config.tile_height)
         self.total_tiles  = self.x_tile_count * self.y_tile_count
         print(f'Mosaic will be {self.x_tile_count:,} tiles wide and {self.y_tile_count:,} tiles high ({self.total_tiles:,} total).')
+        self.np_image = np.array(self.image)
 
     def add_tile(self, tile, coords):
         """Adds the provided image onto the mosiac at the provided coords."""
         try:
-            self.image.paste(tile, coords)
+            np_tile = np.array(tile)
+            self.np_image[coords[1]:coords[3], coords[0]:coords[2], :] = self.config.blending*self.np_image[coords[1]:coords[3], coords[0]:coords[2], :] + (1.-self.config.blending)*np_tile
+#            self.image.paste(tile, coords)
         except TypeError as e:
             print('Maybe the tiles are not the right size. ' + str(e))
 
     def save(self):
-        self.image.save(self.target)
+        Image.fromarray(np.uint8(self.np_image)).save(self.target)
 
 def coords_from_middle(x_count, y_count, y_bias=1, shuffle_first=0, ):
     '''
@@ -207,9 +219,24 @@ def coords_from_middle(x_count, y_count, y_bias=1, shuffle_first=0, ):
     coords.sort(key=lambda c: abs(c[0]-x_mid)*y_bias + abs(c[1]-y_mid))
     coords = shuffle_first_items(coords, shuffle_first)
     return coords
-    
 
-def create_mosaic(source_path, target, tile_ratio=1920/800, tile_width=75, enlargement=8, reuse=True, color_mode='RGB', tile_paths=None, shuffle_first=30):
+
+def match_tile(coord, source_image, tile_box, config, reuse):
+    x, y = coord
+#    print(x,y)
+    # Make a box for this sector
+    box_crop = (x * config.tile_width, y * config.tile_height, (x + 1) * config.tile_width, (y + 1) * config.tile_height)
+
+    # Get Original Image Data for this Sector
+    comparison_block = source_image.crop(box_crop)
+
+    # Get Best Image name that matches the Orig Sector image
+    tile_match_i = tile_box.best_tile_from_block(comparison_block, reuse=reuse)
+    
+    return box_crop, tile_match_i
+
+
+def create_mosaic(source_path, target, tile_ratio=1920/800, tile_width=75, enlargement=8, reuse=True, color_mode='RGB', tile_paths=None, shuffle_first=30, blending=0, njobs=1):
     """Forms an mosiac from an original image using the best
     tiles provided. This reads, processes, and keeps in memory
     a copy of the source image, and all the tiles while processing.
@@ -232,6 +259,7 @@ def create_mosaic(source_path, target, tile_ratio=1920/800, tile_width=75, enlar
         tile_width = tile_width,		# height/width of mosaic tiles in pixels
         enlargement = enlargement,	    # the mosaic image will be this many times wider and taller than the original
         color_mode = color_mode,	    # L for greyscale or RGB for color
+        blending = blending,
     )
     # Pull in and Process Original Image
     print('Setting Up Target image')
@@ -243,29 +271,49 @@ def create_mosaic(source_path, target, tile_ratio=1920/800, tile_width=75, enlar
     # Assest Tiles, and save if needed, returns directories where the small and large pictures are stored
     print('Assessing Tiles')
     tile_box = TileBox(tile_paths, config)
+    
+    progress = tqdm(total=mosaic.total_tiles)
 
     try:
-        progress = ProgressCounter(mosaic.total_tiles)
-        for x, y in coords_from_middle(mosaic.x_tile_count, mosaic.y_tile_count, y_bias=config.tile_ratio, shuffle_first=shuffle_first):
+        pool = multiprocessing.Pool(njobs)
+        coords = coords_from_middle(mosaic.x_tile_count, mosaic.y_tile_count, y_bias=config.tile_ratio, shuffle_first=shuffle_first)
+        print('Processing')
+
+        results = []
+        for box_crop, tile_match in pool.imap_unordered(partial(match_tile, source_image=source_image.image, tile_box=tile_box, config=config, reuse=reuse), coords, chunksize=max(1,mosaic.total_tiles//(100))):
+            results.append((box_crop, tile_match))
             progress.update()
+        progress.close()
+    
 
-            # Make a box for this sector
-            box_crop = (x * config.tile_width, y * config.tile_height, (x + 1) * config.tile_width, (y + 1) * config.tile_height)
-
-            # Get Original Image Data for this Sector
-            comparison_block = source_image.image.crop(box_crop)
-
-            # Get Best Image name that matches the Orig Sector image
-            tile_match = tile_box.best_tile_from_block(comparison_block, reuse=reuse)
-            
-            # Add Best Match to Mosaic
+        print('Pasting tiles to mosaic ...')
+        for box_crop, tile_match_i in results:
+            tile_match = tile_box.tiles[tile_match_i]
             mosaic.add_tile(tile_match, box_crop)
-
-            # Saving Every Sector
-            mosaic.save() 
-
+        mosaic.save()
     except KeyboardInterrupt:
         print('\nStopping, saving partial image...')
-
+        for box_crop, tile_match_i in results:
+            tile_match = tile_box.tiles[tile_match_i]
+            mosaic.add_tile(tile_match, box_crop)
     finally:
         mosaic.save()
+
+
+if __name__ == '__main__':
+    import argparse
+    import os
+    parser = argparse.ArgumentParser()
+    parser.add_argument('source', type=str)
+    parser.add_argument('target', type=str)
+    parser.add_argument('tiledirectory', type=str)
+    parser.add_argument('--tile_ratio', type=float, default=1)
+    parser.add_argument('--tile_width', type=int, default=50)
+    parser.add_argument('--enlargement', type=int, default=2)
+    parser.add_argument('--reuse', action='store_true', help='Enable the reuse of same tiles')
+    parser.add_argument('--color_mode', type=str, default='RGB', help='RGB or L (for grayscale)')
+    parser.add_argument('--blending', type=float, default=0, help='Value between 0 and 1. 0 no blending.')
+    parser.add_argument('--njobs', type=int, default=1, help='Use more than one job to parallelize processing.')
+    args = parser.parse_args()
+    
+    create_mosaic(args.source, args.target, tile_paths=[os.path.join(args.tiledirectory, f) for f in os.listdir(args.tiledirectory)], tile_ratio=args.tile_ratio, tile_width=args.tile_width, enlargement=args.enlargement, reuse=args.reuse, color_mode=args.color_mode, blending=args.blending, njobs=args.njobs)
